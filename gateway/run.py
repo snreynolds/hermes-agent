@@ -486,9 +486,14 @@ def _parse_session_key(session_key: str) -> "dict | None":
     """Parse a session key into its component parts.
 
     Session keys follow the format
-    ``agent:main:{platform}:{chat_type}:{chat_id}[:{thread_id}[:{user_id}]]``.
+    ``agent:main:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
     Returns a dict with ``platform``, ``chat_type``, ``chat_id``, and
     optionally ``thread_id`` keys, or None if the key doesn't match.
+
+    The 6th element is only returned as ``thread_id`` for chat types where
+    it is unambiguous (``dm`` and ``thread``).  For group/channel sessions
+    the suffix may be a user_id (per-user isolation) rather than a
+    thread_id, so we leave ``thread_id`` out to avoid mis-routing.
     """
     parts = session_key.split(":")
     if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
@@ -497,7 +502,7 @@ def _parse_session_key(session_key: str) -> "dict | None":
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
-        if len(parts) > 5:
+        if len(parts) > 5 and parts[3] in ("dm", "thread"):
             result["thread_id"] = parts[5]
         return result
     return None
@@ -3874,6 +3879,18 @@ class GatewayRunner:
                 pass
 
             response = agent_result.get("final_response") or ""
+
+            # Convert the agent's internal "(empty)" sentinel into a
+            # user-friendly message.  "(empty)" means the model failed to
+            # produce visible content after exhausting all retries (nudge,
+            # prefill, empty-retry, fallback).  Sending the raw sentinel
+            # looks like a bug; a short explanation is more helpful.
+            if response == "(empty)":
+                response = (
+                    "⚠️ The model returned no response after processing tool "
+                    "results. This can happen with some models — try again or "
+                    "rephrase your question."
+                )
             agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
@@ -9400,9 +9417,19 @@ class GatewayRunner:
         # BUT: never suppress delivery when the agent failed — the error
         # message is new content the user hasn't seen, and it must reach
         # them even if streaming had sent earlier partial output.
+        #
+        # Also never suppress when the final response is "(empty)" — this
+        # means the model failed to produce content after tool calls (common
+        # with mimo-v2-pro, GLM-5, etc.).  The stream consumer may have
+        # sent intermediate text ("Let me search for that…") alongside the
+        # tool call, setting already_sent=True, but that text is NOT the
+        # final answer.  Suppressing delivery here leaves the user staring
+        # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
         if _sc and isinstance(response, dict) and not response.get("failed"):
-            if (
+            _final = response.get("final_response") or ""
+            _is_empty_sentinel = not _final or _final == "(empty)"
+            if not _is_empty_sentinel and (
                 getattr(_sc, "final_response_sent", False)
                 or getattr(_sc, "already_sent", False)
             ):
