@@ -754,6 +754,7 @@ class AIAgent:
         self._interrupt_requested = False
         self._interrupt_message = None  # Optional message that triggered interrupt
         self._execution_thread_id: int | None = None  # Set at run_conversation() start
+        self._interrupt_thread_signal_pending = False
         self._client_lock = threading.RLock()
         
         # Subagent delegation state
@@ -2949,7 +2950,15 @@ class AIAgent:
         # Signal all tools to abort any in-flight operations immediately.
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
-        _set_interrupt(True, self._execution_thread_id)
+        if self._execution_thread_id is not None:
+            _set_interrupt(True, self._execution_thread_id)
+            self._interrupt_thread_signal_pending = False
+        else:
+            # The interrupt arrived before run_conversation() finished
+            # binding the agent to its execution thread. Defer the tool-level
+            # interrupt signal until startup completes instead of targeting
+            # the caller thread by mistake.
+            self._interrupt_thread_signal_pending = True
         # Propagate interrupt to any running child agents (subagent delegation)
         with self._active_children_lock:
             children_copy = list(self._active_children)
@@ -2965,7 +2974,9 @@ class AIAgent:
         """Clear any pending interrupt request and the per-thread tool interrupt signal."""
         self._interrupt_requested = False
         self._interrupt_message = None
-        _set_interrupt(False, self._execution_thread_id)
+        self._interrupt_thread_signal_pending = False
+        if self._execution_thread_id is not None:
+            _set_interrupt(False, self._execution_thread_id)
 
     def _touch_activity(self, desc: str) -> None:
         """Update the last-activity timestamp and description (thread-safe)."""
@@ -5522,8 +5533,26 @@ class AIAgent:
 
         t = threading.Thread(target=_call, daemon=True)
         t.start()
+        _last_heartbeat = time.time()
+        _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
         while t.is_alive():
             t.join(timeout=0.3)
+
+            # Periodic heartbeat: touch the agent's activity tracker so the
+            # gateway's inactivity monitor knows we're alive while waiting
+            # for stream chunks.  Without this, long thinking pauses (e.g.
+            # reasoning models) or slow prefill on local providers (Ollama)
+            # trigger false inactivity timeouts.  The _call thread touches
+            # activity on each chunk, but the gap between API call start
+            # and first chunk can exceed the gateway timeout — especially
+            # when the stale-stream timeout is disabled (local providers).
+            _hb_now = time.time()
+            if _hb_now - _last_heartbeat >= _HEARTBEAT_INTERVAL:
+                _last_heartbeat = _hb_now
+                _waiting_secs = int(_hb_now - last_chunk_time["t"])
+                self._touch_activity(
+                    f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
+                )
 
             # Detect stale streams: connections kept alive by SSE pings
             # but delivering no real chunks.  Kill the client so the
@@ -7141,8 +7170,22 @@ class AIAgent:
         # Each slot holds (function_name, function_args, function_result, duration, error_flag)
         results = [None] * num_tools
 
+        # Touch activity before launching workers so the gateway knows
+        # we're executing tools (not stuck).
+        self._current_tool = tool_names_str
+        self._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
+
         def _run_tool(index, tool_call, function_name, function_args):
             """Worker function executed in a thread."""
+            # Set the activity callback on THIS worker thread so
+            # _wait_for_process (terminal commands) can fire heartbeats.
+            # The callback is thread-local; the main thread's callback
+            # is invisible to worker threads.
+            try:
+                from tools.environments.base import set_activity_callback
+                set_activity_callback(self._touch_activity)
+            except Exception:
+                pass
             start = time.time()
             try:
                 result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
@@ -7172,8 +7215,26 @@ class AIAgent:
                     f = executor.submit(_run_tool, i, tc, name, args)
                     futures.append(f)
 
-                # Wait for all to complete (exceptions are captured inside _run_tool)
-                concurrent.futures.wait(futures)
+                # Wait for all to complete with periodic heartbeats so the
+                # gateway's inactivity monitor doesn't kill us during long
+                # concurrent tool batches.
+                _conc_start = time.time()
+                while True:
+                    done, not_done = concurrent.futures.wait(
+                        futures, timeout=30.0,
+                    )
+                    if not not_done:
+                        break
+                    _conc_elapsed = int(time.time() - _conc_start)
+                    _still_running = [
+                        parsed_calls[futures.index(f)][1]
+                        for f in not_done
+                        if f in futures
+                    ]
+                    self._touch_activity(
+                        f"concurrent tools running ({_conc_elapsed}s, "
+                        f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
+                    )
         finally:
             if spinner:
                 # Build a summary message for the spinner stop
@@ -7405,6 +7466,16 @@ class AIAgent:
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
                 )
+                # Bridge: notify external memory provider of built-in memory writes
+                if self._memory_manager and function_args.get("action") in ("add", "replace"):
+                    try:
+                        self._memory_manager.on_memory_write(
+                            function_args.get("action", ""),
+                            target,
+                            function_args.get("content", ""),
+                        )
+                    except Exception:
+                        pass
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
@@ -7881,6 +7952,7 @@ class AIAgent:
         self._thinking_prefill_retries = 0
         self._post_tool_empty_retried = False
         self._last_content_with_tools = None
+        self._last_content_tools_all_housekeeping = False
         self._mute_post_response = False
         self._unicode_sanitization_passes = 0
 
@@ -8068,6 +8140,7 @@ class AIAgent:
                     self._empty_content_retries = 0
                     self._thinking_prefill_retries = 0
                     self._last_content_with_tools = None
+                    self._last_content_tools_all_housekeeping = False
                     self._mute_post_response = False
                     # Re-estimate after compression
                     _preflight_tokens = estimate_request_tokens_rough(
@@ -8127,11 +8200,19 @@ class AIAgent:
         
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
-        # Must be set before clear_interrupt() which uses it.
+        # Must be set before any thread-scoped interrupt syncing.
         self._execution_thread_id = threading.current_thread().ident
 
-        # Clear any stale interrupt state at start
-        self.clear_interrupt()
+        # Always clear stale per-thread state from a previous turn. If an
+        # interrupt arrived before startup finished, preserve it and bind it
+        # to this execution thread now instead of dropping it on the floor.
+        _set_interrupt(False, self._execution_thread_id)
+        if self._interrupt_requested:
+            _set_interrupt(True, self._execution_thread_id)
+            self._interrupt_thread_signal_pending = False
+        else:
+            self._interrupt_message = None
+            self._interrupt_thread_signal_pending = False
 
         # External memory provider: prefetch once before the tool loop.
         # Reuse the cached result on every iteration to avoid re-calling
@@ -10130,6 +10211,7 @@ class AIAgent:
                             tc.function.name in _HOUSEKEEPING_TOOLS
                             for tc in assistant_message.tool_calls
                         )
+                        self._last_content_tools_all_housekeeping = _all_housekeeping
                         if _all_housekeeping and self._has_stream_consumers():
                             self._mute_post_response = True
                         elif self.quiet_mode:
@@ -10312,15 +10394,22 @@ class AIAgent:
                             break
 
                         # If the previous turn already delivered real content alongside
-                        # tool calls (e.g. "You're welcome!" + memory save), the model
-                        # has nothing more to say. Use the earlier content immediately
-                        # instead of wasting API calls on retries that won't help.
+                        # HOUSEKEEPING tool calls (e.g. "You're welcome!" + memory save),
+                        # the model has nothing more to say. Use the earlier content
+                        # immediately instead of wasting API calls on retries.
+                        # NOTE: Only use this shortcut when ALL tools in that turn were
+                        # housekeeping (memory, todo, etc.).  When substantive tools
+                        # were called (terminal, search_files, etc.), the content was
+                        # likely mid-task narration ("I'll scan the directory...") and
+                        # the empty follow-up means the model choked — let the
+                        # post-tool nudge below handle that instead of exiting early.
                         fallback = getattr(self, '_last_content_with_tools', None)
-                        if fallback:
+                        if fallback and getattr(self, '_last_content_tools_all_housekeeping', False):
                             _turn_exit_reason = "fallback_prior_turn_content"
                             logger.info("Empty follow-up after tool calls — using prior turn content as final response")
                             self._emit_status("↻ Empty response after tool calls — using earlier content as final answer")
                             self._last_content_with_tools = None
+                            self._last_content_tools_all_housekeeping = False
                             self._empty_content_retries = 0
                             # Do NOT modify the assistant message content — the
                             # old code injected "Calling the X tools..." which
@@ -10331,13 +10420,18 @@ class AIAgent:
                             break
 
                         # ── Post-tool-call empty response nudge ───────────
-                        # The model returned empty after executing tool calls
-                        # but there's no prior-turn content to fall back on.
+                        # The model returned empty after executing tool calls.
+                        # This covers two cases:
+                        #  (a) No prior-turn content at all — model went silent
+                        #  (b) Prior turn had content + SUBSTANTIVE tools (the
+                        #      fallback above was skipped because the content
+                        #      was mid-task narration, not a final answer)
                         # Instead of giving up, nudge the model to continue by
                         # appending a user-level hint.  This is the #9400 case:
-                        # weaker models (GLM-5, etc.) sometimes return empty
-                        # after tool results instead of continuing to the next
-                        # step.  One retry with a nudge usually fixes it.
+                        # weaker models (mimo-v2-pro, GLM-5, etc.) sometimes
+                        # return empty after tool results instead of continuing
+                        # to the next step.  One retry with a nudge usually
+                        # fixes it.
                         _prior_was_tool = any(
                             m.get("role") == "tool"
                             for m in messages[-5:]  # check recent messages
@@ -10347,6 +10441,10 @@ class AIAgent:
                             and not getattr(self, "_post_tool_empty_retried", False)
                         ):
                             self._post_tool_empty_retried = True
+                            # Clear stale narration so it doesn't resurface
+                            # on a later empty response after the nudge.
+                            self._last_content_with_tools = None
+                            self._last_content_tools_all_housekeeping = False
                             logger.info(
                                 "Empty response after tool calls — nudging model "
                                 "to continue processing"
